@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Experiment Auto-Labeler</title>
+    <base href="/">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Initial Screen -->
+        <div class="card" id="initialScreen">
+            <h1>Stranger Danger Auto-Labeling</h1>
+            <div class="option-grid">
+                <div class="option-card" onclick="showUploadScreen('sharepoint')">
+                    <i class="fab fa-microsoft"></i>
+                    <h3>SharePoint</h3>
+                    <p>Access videos from SharePoint</p>
+                </div>
+                <div class="option-card" onclick="showUploadScreen('local')">
+                    <i class="fas fa-upload"></i>
+                    <h3>Local Upload</h3>
+                    <p>Upload from your device</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- SharePoint Credentials Screen -->
+        <div class="card hidden" id="sharepointCredScreen">
+            <h2>SharePoint Connection</h2>
+            <form id="spCredForm" onsubmit="handleSpCredSubmit(event)">
+                <div class="form-group">
+                    <label>Site URL</label>
+                    <input type="url" id="spSiteUrl" required placeholder="https://yourdomain.sharepoint.com/sites/yoursite">
+                </div>
+                <div class="form-group">
+                    <label>Client ID</label>
+                    <input type="text" id="spClientId" required placeholder="a1b2c3d4-e5f6-7g8h-9i0j-k1l2m3n4o5p6">
+                </div>
+                <div class="form-group">
+                    <label>Client Secret</label>
+                    <input type="password" id="spClientSecret" required placeholder="ABC123~abcdefghijklmnopqrstuvwxyz">
+                </div>
+                <div class="form-group">
+                    <label>Document Library</label>
+                    <input type="text" id="spDocLibrary" value="Documents" required>
+                </div>
+                <button type="submit" class="btn">
+                    <i class="fas fa-check"></i> Connect
+                </button>
+                <button type="button" class="btn secondary" onclick="showScreen('initialScreen')">
+                    <i class="fas fa-arrow-left"></i> Back
+                </button>
+            </form>
+        </div>
+
+        <!-- SharePoint File Selection -->
+        <div class="card hidden" id="sharepointFileScreen">
+            <h2>Select SharePoint File</h2>
+            <div id="spFileList"></div>
+            <button class="btn secondary" onclick="showScreen('sharepointCredScreen')">
+                <i class="fas fa-arrow-left"></i> Back
+            </button>
+        </div>
+
+        <!-- Local Upload Screen -->
+        <div class="card hidden" id="localUploadScreen">
+            <h2>Upload Video</h2>
+            <div class="upload-area" id="dropZone">
+                <i class="fas fa-cloud-upload-alt"></i>
+                <p>Drag & drop or click to upload</p>
+                <input type="file" id="videoInput" hidden accept="video/*">
+            </div>
+            <div class="preview-container">
+                <video id="videoPreview" class="hidden" controls></video>
+            </div>
+            <button class="btn" id="analyzeBtn" onclick="startAnalysis()" disabled>
+                <i class="fas fa-play"></i> Start Analysis
+            </button>
+            <button class="btn secondary" onclick="showScreen('initialScreen')">
+                <i class="fas fa-arrow-left"></i> Back
+            </button>
+        </div>
+
+        <!-- Progress Screen -->
+        <div class="card hidden" id="progressScreen">
+            <h2>Analyzing Video</h2>
+            <div class="progress-container">
+                <div class="progress-bar" id="progressBar"></div>
+                <div id="frameCounter"></div>
+            </div>
+            <p id="progressMessage">Initializing analysis...</p>
+            <div class="button-group">
+                <button class="btn danger" id="cancelBtn" onclick="cancelAnalysis()">
+                    <i class="fas fa-stop-circle"></i> Cancel Analysis
+                </button>
+            </div>
+        </div>
+
+        <!-- Results Screen -->
+        <div class="card hidden" id="resultsScreen">
+            <h2>Analysis Complete!</h2>
+            <div class="result-badge">
+                <i class="fas fa-check-circle"></i>
+            </div>
+            <button class="btn" id="downloadBtn">
+                <i class="fas fa-download"></i> Download Report
+            </button>
+            <button class="btn secondary" id="newAnalysisBtn">
+                <i class="fas fa-redo"></i> New Analysis
+            </button>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
