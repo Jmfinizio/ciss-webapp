@@ -53,8 +53,8 @@ app.add_middleware(
 app.mount("/static", os.path.join(Path(__file__).parent, "static"), name="static")
 
 # Configuration values
-MODEL_PATH = os.path.join(Path(__file__).parent, "parents_child_stranger.pt")
-POSE_MODEL_PATH = os.path.join(Path(__file__).parent, "yolov8n-pose.pt")
+MODEL_PATH = os.path.join(Path(__file__).parent.parent, "parents_child_stranger.pt")
+POSE_MODEL_PATH = os.path.join(Path(__file__).parent.parent, "yolov8n-pose.pt")
 MAX_VIDEO_SIZE = 500 * 1024 * 1024
 OUTPUT_DIR = os.path.join(Path(__file__).parent, "analysis_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
