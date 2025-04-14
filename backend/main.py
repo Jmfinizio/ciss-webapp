@@ -98,7 +98,10 @@ def update_progress(current_frame: int, total_frames: int, message: str):
 
 def detect_child_and_crop(frame):
     try:
+        logger.info("Starting child detection on current frame")
         results = app.state.detection_model(frame, verbose=False)[0]
+        logger.info("Detection results received")
+
         class_ids = results.boxes.cls.cpu().numpy()
         confidences = results.boxes.conf.cpu().numpy()
         bboxes = results.boxes.xyxy.cpu().numpy()
@@ -125,6 +128,7 @@ def detect_child_and_crop(frame):
                         stranger_conf = conf
 
         if child_bbox is None:
+            logger.info("No child detected in this frame")
             return None, 0, None, None
 
         # Distance calculation functions
@@ -159,7 +163,8 @@ def detect_child_and_crop(frame):
 
         # Categorization logic with mutual inference
         def categorize(d):
-            if d is None: return None
+            if d is None:
+                return None
             return 2 if d < 20 else 1 if d < 200 else 0
 
         category_adult = categorize(adjusted_distance_adult)
@@ -189,11 +194,14 @@ def detect_child_and_crop(frame):
         x1, y1, x2, y2 = map(int, child_bbox)
         child_roi = frame[y1:y2, x1:x2]
 
+        logger.info("Child detection completed successfully")
         return child_roi, parent_count, category_adult, category_stranger
 
     except Exception as e:
-        logger.error(f"Detection error: {str(e)}")
-        return None, 0, None, None
+        tb = traceback.format_exc()
+        logger.error(f"Detection error: {str(e)}\n{tb}")
+        raise  # Re-raise to propagate the error with full traceback
+
 
 def process_pose(image):
     try:
