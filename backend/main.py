@@ -50,10 +50,13 @@ app.add_middleware(
 )
 
 # Configuration
-BASE_DIR = Path(__file__).parent.resolve()
-MODEL_PATH = BASE_DIR / "parents_child_stranger.pt"
+app.mount("/static", os.path.join(Path(__file__).parent, "static"), name="static")
+
+# Configuration values
+MODEL_PATH = os.path.join(Path(__file__).parent, "parents_child_stranger.pt")
+POSE_MODEL_PATH = os.path.join(Path(__file__).parent, "yolov8n-pose.pt")
 MAX_VIDEO_SIZE = 500 * 1024 * 1024
-OUTPUT_DIR = BASE_DIR / "analysis_output"
+OUTPUT_DIR = os.path.join(Path(__file__).parent, "analysis_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Global state
@@ -401,14 +404,17 @@ async def get_results(process_id: str):
     
     return FileResponse(result_path, filename="analysis.csv")
 
-@app.get("/")
-async def serve_frontend():
-    frontend_path =  "frontend" / "index.html"
+@app.get("/{full_path:path}")
+async def serve_frontend(full_path: str):
+    # Avoid API and static file paths
+    if full_path.startswith(("api/", "static/")):
+        raise HTTPException(status_code=404)
+    
+    # Serve index.html for all other routes.
+    frontend_path = Path(os.path.join(Path(__file__).parent.parent, "frontend", "index.html"))
     if not frontend_path.exists():
-        raise HTTPException(status_code=404, detail="Frontend not found")
+        raise HTTPException(status_code=404, detail=f"Frontend not found at {frontend_path.absolute()}")
     return FileResponse(frontend_path)
-
-app.mount("/static", StaticFiles(directory= "frontend" / "static"), name="static")
 
 if __name__ == "__main__":
     import uvicorn
