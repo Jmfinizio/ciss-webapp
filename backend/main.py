@@ -258,6 +258,7 @@ async def process_video(
     try:
         # Handle file source (SharePoint or direct upload)
         if file_id:  # SharePoint file
+            logger.info("Processing SharePoint file...")
             ctx = get_sharepoint_context(site_url, client_id, client_secret)
             file = ctx.web.get_file_by_id(file_id)
             ctx.load(file)
@@ -265,37 +266,35 @@ async def process_video(
             video_path = os.path.join(temp_dir, file.properties["Name"])
             with open(video_path, "wb") as f:
                 file.download(f).execute_query()
+            logger.info(f"Downloaded SharePoint video to {video_path}")
         else:  # Direct upload
+            logger.info("Processing direct file upload...")
             video_path = os.path.join(temp_dir, video.filename)
             with open(video_path, "wb") as f:
                 content = await video.read()
                 f.write(content)
+            logger.info(f"Video file saved to {video_path}")
 
         # Open the video file and check if opened successfully
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            logger.error(f"Failed to open video file at {video_path}")
-            raise HTTPException(500, "Failed to open video file.")
+            error_msg = f"Failed to open video file at {video_path}"
+            logger.error(error_msg)
+            raise HTTPException(500, error_msg)
 
         original_fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        logger.info(f"Original FPS: {original_fps}, Total Frames: {total_frames}")
         if original_fps <= 0 or original_fps > 240:
             original_fps = 30
             logger.warning(f"Using default FPS: {original_fps}")
 
         duration_seconds = int(total_frames / original_fps)
+        logger.info(f"Video duration (seconds): {duration_seconds}")
         total_processed = duration_seconds
         processed = 0
 
-        logger.info(f"""
-            Video Analysis Started
-            ----------------------
-            Path: {video_path}
-            FPS: {original_fps}
-            Total Frames: {total_frames}
-            Duration: {duration_seconds}s
-            Process Frames: {total_processed}
-        """)
+        logger.info(f"Video Analysis Started for file: {video_path}")
 
         results = []
         prev_landmarks = None
@@ -303,19 +302,20 @@ async def process_video(
 
         update_progress(0, total_processed, "Initializing analysis...")
 
-        # Process video frame by frame (one frame per second)
         for second in range(duration_seconds):
             if not ANALYSIS_ACTIVE:
+                logger.info("Analysis cancelled by user.")
                 break
 
             current_frame = int(second * original_fps)
             update_progress(current_frame, total_frames, f"Processing frame {current_frame}/{total_frames}")
-
+            logger.info(f"Processing second {second} (frame {current_frame})")
+            
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
             ret, frame = cap.read()
 
             if not ret:
-                logger.warning(f"Skipping second {second} due to failed frame read.")
+                logger.warning(f"Frame read failed at second {second} (frame {current_frame}); skipping.")
                 continue
 
             processed += 1
@@ -325,12 +325,14 @@ async def process_video(
                 # Child detection
                 child_roi, _, adult_dist, stranger_dist = detect_child_and_crop(frame)
                 if child_roi is None:
+                    logger.info(f"{timecode}: No child detected")
                     update_progress(processed, total_processed, f"{timecode}: No child detected")
                     continue
 
                 # Face analysis
                 face_score, curr_landmarks = facial_keypoints(child_roi, prev_landmarks)
                 prev_landmarks = curr_landmarks
+                logger.info(f"{timecode}: Face score = {face_score}")
 
                 # Pose analysis
                 pose_kps = process_pose(child_roi)
@@ -345,8 +347,8 @@ async def process_video(
                         )
                         body_movement = round(total_movement / valid_points, 2)
                 prev_pose = pose_kps
+                logger.info(f"{timecode}: Body movement = {body_movement}")
 
-                # Store results
                 results.append({
                     "second": second,
                     "timecode": timecode,
@@ -364,16 +366,16 @@ async def process_video(
                     ("" if stranger_dist is None else f" | Stranger: {stranger_dist}")
                 )
 
-            except Exception as e:
+            except Exception as inner_e:
                 tb = traceback.format_exc()
-                logger.error(f"Error processing second {second}: {str(e)}\n{tb}")
+                logger.error(f"Error processing second {second}: {str(inner_e)}\n{tb}")
                 update_progress(processed, total_processed, f"{timecode}: Error processing")
 
-        # Save analysis results
+        # Save the results to CSV
         df = pd.DataFrame(results)
         csv_path = os.path.join(session_dir, "analysis.csv")
         df.to_csv(csv_path, index=False)
-        logger.info(f"Analysis complete. Generated {len(results)} records")
+        logger.info(f"Analysis complete. Generated {len(results)} records, saving to {csv_path}")
 
         return FileResponse(csv_path, filename="analysis.csv")
 
