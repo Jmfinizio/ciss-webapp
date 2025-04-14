@@ -256,7 +256,7 @@ async def process_video(
     video_path = None  # Initialize video_path
 
     try:
-        # Handle file source
+        # Handle file source (SharePoint or direct upload)
         if file_id:  # SharePoint file
             ctx = get_sharepoint_context(site_url, client_id, client_secret)
             file = ctx.web.get_file_by_id(file_id)
@@ -271,12 +271,14 @@ async def process_video(
                 content = await video.read()
                 f.write(content)
 
-        # Video processing setup
+        # Open the video file and check if opened successfully
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.error(f"Failed to open video file at {video_path}")
+            raise HTTPException(500, "Failed to open video file.")
+
         original_fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Validate and adjust FPS
         if original_fps <= 0 or original_fps > 240:
             original_fps = 30
             logger.warning(f"Using default FPS: {original_fps}")
@@ -301,26 +303,24 @@ async def process_video(
 
         update_progress(0, total_processed, "Initializing analysis...")
 
+        # Process video frame by frame (one frame per second)
         for second in range(duration_seconds):
             if not ANALYSIS_ACTIVE:
                 break
-                
-            # Calculate actual frame number being processed
+
             current_frame = int(second * original_fps)
             update_progress(current_frame, total_frames, f"Processing frame {current_frame}/{total_frames}")
 
-            # Get frame for current second
-            target_frame = int(second * original_fps)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
             ret, frame = cap.read()
-            
+
             if not ret:
-                logger.warning(f"Skipping second {second}")
+                logger.warning(f"Skipping second {second} due to failed frame read.")
                 continue
 
             processed += 1
             timecode = f"{second//60:02d}:{second%60:02d}"
-            
+
             try:
                 # Child detection
                 child_roi, _, adult_dist, stranger_dist = detect_child_and_crop(frame)
@@ -336,14 +336,13 @@ async def process_video(
                 pose_kps = process_pose(child_roi)
                 body_movement = 0.0
                 if pose_kps is not None and prev_pose is not None:
-                    valid_points = 0
-                    total_movement = sum(
-                        np.linalg.norm(curr - prev)
-                        for prev, curr in zip(prev_pose, pose_kps)
-                        if not (np.isnan(curr).any() or np.isnan(prev).any())
-                    )
-                    valid_points = len([p for p in pose_kps if not np.isnan(p).any()])
+                    valid_points = sum(1 for p in pose_kps if not np.isnan(p).any())
                     if valid_points > 0:
+                        total_movement = sum(
+                            np.linalg.norm(curr - prev)
+                            for prev, curr in zip(prev_pose, pose_kps)
+                            if not (np.isnan(curr).any() or np.isnan(prev).any())
+                        )
                         body_movement = round(total_movement / valid_points, 2)
                 prev_pose = pose_kps
 
@@ -360,16 +359,17 @@ async def process_video(
                 update_progress(
                     processed,
                     total_processed,
-                    f"{timecode}: Child detected" + 
+                    f"{timecode}: Child detected" +
                     ("" if adult_dist is None else f" | Adult: {adult_dist}") +
                     ("" if stranger_dist is None else f" | Stranger: {stranger_dist}")
                 )
 
             except Exception as e:
-                logger.error(f"Second {second} error: {str(e)}")
+                tb = traceback.format_exc()
+                logger.error(f"Error processing second {second}: {str(e)}\n{tb}")
                 update_progress(processed, total_processed, f"{timecode}: Error processing")
 
-        # Save results
+        # Save analysis results
         df = pd.DataFrame(results)
         csv_path = os.path.join(session_dir, "analysis.csv")
         df.to_csv(csv_path, index=False)
@@ -378,8 +378,9 @@ async def process_video(
         return FileResponse(csv_path, filename="analysis.csv")
 
     except Exception as e:
-        logger.error(f"Processing failed: {str(e)}")
-        raise HTTPException(500, str(e))
+        tb = traceback.format_exc()
+        logger.error(f"Processing failed: {str(e)}\n{tb}")
+        raise HTTPException(500, f"Processing failed: {str(e)}")
     finally:
         ANALYSIS_ACTIVE = False
         if cap:
@@ -387,6 +388,7 @@ async def process_video(
         if video_path and os.path.exists(video_path):
             os.remove(video_path)
         shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 @app.post("/api/delete-video")
 async def delete_video(process_id: str = Form(...)):
