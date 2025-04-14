@@ -21,17 +21,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from office365.runtime.auth.client_credential import ClientCredential
 from office365.sharepoint.client_context import ClientContext
-from ultralytics.nn.tasks import DetectionModel
-from torch.nn.modules.container import Sequential
-from ultralytics.nn.modules import Conv, C2f, SPPF, Detect, Bottleneck, Concat, DFL
-from torch.nn import Conv2d, BatchNorm2d, Linear, SiLU, ModuleList, Upsample, MaxPool2d
 
 # Initialize application with safe globals
 torch.serialization.add_safe_globals([
-    Conv2d, BatchNorm2d, Linear, Sequential, SiLU, ModuleList, Upsample, MaxPool2d,
-    DetectionModel, Conv, C2f, SPPF, Detect, Bottleneck, Concat, DFL
+    torch.nn.modules.conv.Conv2d,
+    torch.nn.modules.batchnorm.BatchNorm2d,
+    torch.nn.modules.linear.Linear,
+    torch.nn.modules.container.Sequential,
+    torch.nn.modules.activation.SiLU,
+    torch.nn.modules.container.ModuleList,
+    torch.nn.modules.upsampling.Upsample,
+    torch.nn.modules.pooling.MaxPool2d
 ])
 
+# Configure logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -46,18 +49,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="frontend/static"), name="static")
-
 # Configuration
-MODEL_PATH = "parents_child_stranger.pt"
+BASE_DIR = Path(__file__).parent.resolve()
+MODEL_PATH = BASE_DIR / "parents_child_stranger.pt"
 MAX_VIDEO_SIZE = 500 * 1024 * 1024
-OUTPUT_DIR = "analysis_output"
+OUTPUT_DIR = BASE_DIR / "analysis_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Global state
 PROGRESS_STORE = {}
-current_process_id = None
-ANALYSIS_ACTIVE = False
 
 # MediaPipe initialization
 mp_face_mesh = mp.solutions.face_mesh
@@ -77,43 +77,54 @@ LANDMARKS = {
 }
 
 @app.on_event("startup")
-async def startup_event():
-    app.state.detection_model = YOLO(MODEL_PATH).to('cuda' if torch.cuda.is_available() else 'cpu')
-    app.state.pose_model = YOLO("yolov8n-pose.pt").to('cuda' if torch.cuda.is_available() else 'cpu')
+async def initialize_models():
+    """Initialize models with warmup inference"""
+    try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        logger.info(f"Initializing models on {device.upper()}")
+
+        # Initialize detection model
+        app.state.detection_model = YOLO(MODEL_PATH).to(device)
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        app.state.detection_model(dummy, verbose=False)  # Warmup
+        
+        # Initialize pose model
+        app.state.pose_model = YOLO("yolov8n-pose.pt").to(device)
+        app.state.pose_model(dummy, verbose=False)  # Warmup
+        
+        logger.info("Models initialized successfully")
+    except Exception as e:
+        logger.error(f"Model initialization failed: {str(e)}")
+        raise RuntimeError(f"Model initialization failed: {str(e)}")
 
 def get_sharepoint_context(site_url: str, client_id: str, client_secret: str):
+    """Create SharePoint client context"""
     return ClientContext(site_url).with_credentials(
         ClientCredential(client_id, client_secret))
-        
-def update_progress(current_frame: int, total_frames: int, message: str):
-    global current_process_id, ANALYSIS_ACTIVE
-    if current_process_id and ANALYSIS_ACTIVE:
-        progress = {
-            "percent": min(100, (current_frame / total_frames) * 100),
-            "message": message,
-            "current_frame": current_frame,
-            "total_frames": total_frames
-        }
-        PROGRESS_STORE[current_process_id] = progress
+
+def update_progress(process_id: str, current: int, total: int, message: str):
+    """Update progress store with analysis status"""
+    PROGRESS_STORE[process_id] = {
+        "percent": min(100, (current / total) * 100),
+        "message": message,
+        "current": current,
+        "total": total,
+        "status": "processing"
+    }
 
 def detect_child_and_crop(frame):
     try:
-        logger.info("Starting child detection on current frame")
         results = app.state.detection_model(frame, verbose=False)[0]
-        logger.info("Detection results received")
-
         class_ids = results.boxes.cls.cpu().numpy()
         confidences = results.boxes.conf.cpu().numpy()
         bboxes = results.boxes.xyxy.cpu().numpy()
 
-        # Track best detections for each class
         child_bbox = None
         adult_bbox = None
         stranger_bbox = None
         adult_conf = 0
         stranger_conf = 0
 
-        # Find highest confidence detections for each relevant class
         for box, cls, conf in zip(bboxes, class_ids, confidences):
             if conf > 0.6:
                 if cls == 1:  # Child
@@ -128,49 +139,41 @@ def detect_child_and_crop(frame):
                         stranger_conf = conf
 
         if child_bbox is None:
-            logger.info("No child detected in this frame")
             return None, 0, None, None
 
-        # Distance calculation functions
         def euclidean_distance(box1, box2):
             if box1 is None or box2 is None:
                 return None
-            center1 = ((box1[0] + box1[2]) / 2, (box1[1] + box1[3]) / 2)
-            center2 = ((box2[0] + box2[2]) / 2, (box2[1] + box2[3]) / 2)
+            center1 = ((box1[0] + box1[2])/2, (box1[1] + box1[3])/2)
+            center2 = ((box2[0] + box2[2])/2, (box2[1] + box2[3])/2)
             return np.linalg.norm(np.array(center1) - np.array(center2))
 
         def calculate_diagonal(bbox):
-            if bbox is None:
-                return 0
-            return np.sqrt((bbox[2] - bbox[0]) ** 2 + (bbox[3] - bbox[1]) ** 2)
+            return np.sqrt((bbox[2]-bbox[0])**2 + (bbox[3]-bbox[1])**2) if bbox else 0
 
-        # Calculate adjusted distances with confidence check
         adjusted_distance_adult = None
-        if adult_bbox is not None and adult_conf > 0.6:
+        if adult_bbox and adult_conf > 0.6:
             adult_diagonal = calculate_diagonal(adult_bbox)
             child_diagonal = calculate_diagonal(child_bbox)
             raw_dist = euclidean_distance(child_bbox, adult_bbox)
-            if raw_dist is not None:
-                adjusted_distance_adult = raw_dist * (abs(adult_diagonal - 1.67 * child_diagonal) / 1000)
+            if raw_dist:
+                adjusted_distance_adult = raw_dist * (abs(adult_diagonal - 1.67*child_diagonal)/1000)
 
         adjusted_distance_stranger = None
-        if stranger_bbox is not None and stranger_conf > 0.6:
+        if stranger_bbox and stranger_conf > 0.6:
             stranger_diagonal = calculate_diagonal(stranger_bbox)
             child_diagonal = calculate_diagonal(child_bbox)
             raw_dist = euclidean_distance(child_bbox, stranger_bbox)
-            if raw_dist is not None:
-                adjusted_distance_stranger = raw_dist * (abs(stranger_diagonal - 1.67 * child_diagonal) / 1000)
+            if raw_dist:
+                adjusted_distance_stranger = raw_dist * (abs(stranger_diagonal - 1.67*child_diagonal)/1000)
 
-        # Categorization logic with mutual inference
         def categorize(d):
-            if d is None:
-                return None
+            if d is None: return None
             return 2 if d < 20 else 1 if d < 200 else 0
 
         category_adult = categorize(adjusted_distance_adult)
         category_stranger = categorize(adjusted_distance_stranger)
 
-        # Improved mutual inference logic
         if category_adult is not None:
             if category_adult == 2:
                 category_stranger = 0
@@ -186,22 +189,14 @@ def detect_child_and_crop(frame):
             elif category_stranger == 0:
                 category_adult = 2
 
-        # Count valid detections
-        parent_count = np.sum((class_ids == 0) & (confidences > 0.6))
-        stranger_count = np.sum((class_ids == 2) & (confidences > 0.6))
-
-        # Crop child ROI
         x1, y1, x2, y2 = map(int, child_bbox)
         child_roi = frame[y1:y2, x1:x2]
 
-        logger.info("Child detection completed successfully")
-        return child_roi, parent_count, category_adult, category_stranger
+        return child_roi, len([x for x in class_ids if x == 0]), category_adult, category_stranger
 
     except Exception as e:
-        tb = traceback.format_exc()
-        logger.error(f"Detection error: {str(e)}\n{tb}")
-        raise  # Re-raise to propagate the error with full traceback
-
+        logger.error(f"Detection error: {str(e)}")
+        return None, 0, None, None
 
 def process_pose(image):
     try:
@@ -229,133 +224,93 @@ def facial_keypoints(image, prev_landmarks=None):
         movement_score = 0
         if prev_landmarks:
             total_diff = sum(
-                np.sqrt((cx - px) ** 2 + (cy - py) ** 2)
+                np.sqrt((cx - px)**2 + (cy - py)**2)
                 for key in LANDMARKS
                 for (px, py), (cx, cy) in zip(prev_landmarks.get(key, []), current_landmarks.get(key, []))
             )
             valid_points = sum(len(landmarks) for landmarks in current_landmarks.values())
-            if valid_points > 0:
-                avg_diff = total_diff / valid_points
-                movement_score = 2 if avg_diff > 6 else 1 if avg_diff > 3 else 0
+            movement_score = 2 if (total_diff/valid_points) > 6 else 1 if (total_diff/valid_points) > 3 else 0
 
         return movement_score, current_landmarks
     except Exception as e:
         logger.error(f"Facial processing error: {str(e)}")
         return 0, None
 
-@app.post("/api/process-video")
-async def process_video(
-    video: UploadFile = File(None),
-    file_id: str = Form(None),
-    site_url: str = Form(None),
-    client_id: str = Form(None),
-    client_secret: str = Form(None),
-    doc_library: str = Form(None),
-    background_tasks: BackgroundTasks = None
-):
-    global current_process_id, ANALYSIS_ACTIVE
-    current_process_id = str(uuid.uuid4())
-    ANALYSIS_ACTIVE = True
+def calculate_body_movement(current_pose, previous_pose):
+    if current_pose is None or previous_pose is None:
+        return 0.0
+    
+    valid_points = 0
+    total_movement = 0.0
+    
+    for prev, curr in zip(previous_pose, current_pose):
+        if not (np.isnan(prev).any() or np.isnan(curr).any()):
+            valid_points += 1
+            total_movement += np.linalg.norm(curr - prev)
+    
+    return round(total_movement / valid_points, 2) if valid_points > 0 else 0.0
 
-    session_dir = os.path.join(OUTPUT_DIR, f"session_{current_process_id}")
-    os.makedirs(session_dir, exist_ok=True)
-    temp_dir = tempfile.mkdtemp()
-    cap = None
-    video_path = None  # Initialize video_path
+async def download_sharepoint_file(file_id: str, site_url: str, client_id: str, client_secret: str, temp_dir: Path):
+    ctx = get_sharepoint_context(site_url, client_id, client_secret)
+    file = ctx.web.get_file_by_id(file_id)
+    ctx.load(file)
+    ctx.execute_query()
+    
+    video_path = temp_dir / file.properties["Name"]
+    with open(video_path, "wb") as f:
+        file.download(f).execute_query()
+    
+    return video_path
 
+async def process_video_async(process_id: str, video_path: Path, session_dir: Path):
     try:
-        # Handle file source (SharePoint or direct upload)
-        if file_id:  # SharePoint file
-            logger.info("Processing SharePoint file...")
-            ctx = get_sharepoint_context(site_url, client_id, client_secret)
-            file = ctx.web.get_file_by_id(file_id)
-            ctx.load(file)
-            ctx.execute_query()
-            video_path = os.path.join(temp_dir, file.properties["Name"])
-            with open(video_path, "wb") as f:
-                file.download(f).execute_query()
-            logger.info(f"Downloaded SharePoint video to {video_path}")
-        else:  # Direct upload
-            logger.info("Processing direct file upload...")
-            video_path = os.path.join(temp_dir, video.filename)
-            with open(video_path, "wb") as f:
-                content = await video.read()
-                f.write(content)
-            logger.info(f"Video file saved to {video_path}")
-
-        # Open the video file and check if opened successfully
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            error_msg = f"Failed to open video file at {video_path}"
-            logger.error(error_msg)
-            raise HTTPException(500, error_msg)
+            raise RuntimeError(f"Failed to open video: {video_path}")
 
         original_fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        logger.info(f"Original FPS: {original_fps}, Total Frames: {total_frames}")
-        if original_fps <= 0 or original_fps > 240:
-            original_fps = 30
-            logger.warning(f"Using default FPS: {original_fps}")
-
         duration_seconds = int(total_frames / original_fps)
-        logger.info(f"Video duration (seconds): {duration_seconds}")
-        total_processed = duration_seconds
-        processed = 0
-
-        logger.info(f"Video Analysis Started for file: {video_path}")
-
+        
         results = []
         prev_landmarks = None
         prev_pose = None
 
-        update_progress(0, total_processed, "Initializing analysis...")
+        PROGRESS_STORE[process_id] = {
+            "percent": 0,
+            "message": "Starting analysis...",
+            "current": 0,
+            "total": duration_seconds,
+            "status": "processing"
+        }
 
         for second in range(duration_seconds):
-            if not ANALYSIS_ACTIVE:
-                logger.info("Analysis cancelled by user.")
+            if PROGRESS_STORE.get(process_id, {}).get("status") == "cancelled":
+                logger.info(f"Process {process_id} cancelled")
                 break
 
             current_frame = int(second * original_fps)
-            update_progress(current_frame, total_frames, f"Processing frame {current_frame}/{total_frames}")
-            logger.info(f"Processing second {second} (frame {current_frame})")
-            
             cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
             ret, frame = cap.read()
 
             if not ret:
-                logger.warning(f"Frame read failed at second {second} (frame {current_frame}); skipping.")
+                logger.warning(f"Skipping frame {current_frame}")
                 continue
 
-            processed += 1
             timecode = f"{second//60:02d}:{second%60:02d}"
+            update_progress(process_id, second+1, duration_seconds, f"Processing {timecode}")
 
             try:
-                # Child detection
                 child_roi, _, adult_dist, stranger_dist = detect_child_and_crop(frame)
                 if child_roi is None:
-                    logger.info(f"{timecode}: No child detected")
-                    update_progress(processed, total_processed, f"{timecode}: No child detected")
                     continue
 
-                # Face analysis
                 face_score, curr_landmarks = facial_keypoints(child_roi, prev_landmarks)
                 prev_landmarks = curr_landmarks
-                logger.info(f"{timecode}: Face score = {face_score}")
 
-                # Pose analysis
                 pose_kps = process_pose(child_roi)
-                body_movement = 0.0
-                if pose_kps is not None and prev_pose is not None:
-                    valid_points = sum(1 for p in pose_kps if not np.isnan(p).any())
-                    if valid_points > 0:
-                        total_movement = sum(
-                            np.linalg.norm(curr - prev)
-                            for prev, curr in zip(prev_pose, pose_kps)
-                            if not (np.isnan(curr).any() or np.isnan(prev).any())
-                        )
-                        body_movement = round(total_movement / valid_points, 2)
+                body_movement = calculate_body_movement(pose_kps, prev_pose)
                 prev_pose = pose_kps
-                logger.info(f"{timecode}: Body movement = {body_movement}")
 
                 results.append({
                     "second": second,
@@ -366,104 +321,96 @@ async def process_video(
                     "stranger_distance": stranger_dist if stranger_dist is not None else -1
                 })
 
-                update_progress(
-                    processed,
-                    total_processed,
-                    f"{timecode}: Child detected" +
-                    ("" if adult_dist is None else f" | Adult: {adult_dist}") +
-                    ("" if stranger_dist is None else f" | Stranger: {stranger_dist}")
-                )
+                if second % 30 == 0:
+                    pd.DataFrame(results).to_csv(session_dir / "partial.csv", index=False)
 
-            except Exception as inner_e:
-                tb = traceback.format_exc()
-                logger.error(f"Error processing second {second}: {str(inner_e)}\n{tb}")
-                update_progress(processed, total_processed, f"{timecode}: Error processing")
+            except Exception as e:
+                logger.error(f"Error processing second {second}: {str(e)}")
 
-        # Save the results to CSV
-        df = pd.DataFrame(results)
-        csv_path = os.path.join(session_dir, "analysis.csv")
-        df.to_csv(csv_path, index=False)
-        logger.info(f"Analysis complete. Generated {len(results)} records, saving to {csv_path}")
-
-        return FileResponse(csv_path, filename="analysis.csv")
+        pd.DataFrame(results).to_csv(session_dir / "analysis.csv", index=False)
+        PROGRESS_STORE[process_id]["status"] = "completed"
+        PROGRESS_STORE[process_id]["result"] = str(session_dir / "analysis.csv")
 
     except Exception as e:
-        tb = traceback.format_exc()
-        logger.error(f"Processing failed: {str(e)}\n{tb}")
-        raise HTTPException(500, f"Processing failed: {str(e)}")
+        logger.error(f"Processing failed: {str(e)}")
+        PROGRESS_STORE[process_id]["status"] = "error"
+        PROGRESS_STORE[process_id]["error"] = str(e)
     finally:
-        ANALYSIS_ACTIVE = False
-        if cap:
-            cap.release()
-        if video_path and os.path.exists(video_path):
-            os.remove(video_path)
+        cap.release()
+        if video_path.exists():
+            video_path.unlink()
+
+@app.post("/api/process-video")
+async def start_processing(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(None),
+    file_id: str = Form(None),
+    site_url: str = Form(None),
+    client_id: str = Form(None),
+    client_secret: str = Form(None)
+):
+    process_id = str(uuid.uuid4())
+    temp_dir = Path(tempfile.mkdtemp())
+    session_dir = OUTPUT_DIR / f"session_{process_id}"
+    session_dir.mkdir(exist_ok=True)
+
+    try:
+        if file_id:
+            video_path = await download_sharepoint_file(file_id, site_url, client_id, client_secret, temp_dir)
+        else:
+            video_path = temp_dir / video.filename
+            with open(video_path, "wb") as f:
+                content = await video.read()
+                f.write(content)
+
+        background_tasks.add_task(process_video_async, process_id, video_path, session_dir)
+        return JSONResponse({"process_id": process_id, "status_url": f"/api/progress/{process_id}"})
+
+    except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(500, detail=str(e))
 
+@app.get("/api/progress/{process_id}")
+async def get_progress(process_id: str):
+    progress = PROGRESS_STORE.get(process_id)
+    if not progress:
+        raise HTTPException(404, detail="Process not found")
+    if progress.get("status") == "error":
+        raise HTTPException(500, detail=progress.get("error", "Unknown error"))
+    return progress
 
-@app.post("/api/delete-video")
-async def delete_video(process_id: str = Form(...)):
-    if process_id in UPLOADED_VIDEOS:
-        try:
-            video_info = UPLOADED_VIDEOS.pop(process_id)
-            paths = [
-                video_info["video_path"],
-                video_info["temp_dir"],
-                video_info["session_dir"]
-            ]
-            for path in paths:
-                if os.path.exists(path):
-                    if os.path.isfile(path):
-                        os.remove(path)
-                    else:
-                        shutil.rmtree(path, ignore_errors=True)
-            return {"status": "deleted"}
-        except Exception as e:
-            logger.error(f"Deletion error: {str(e)}")
-            raise HTTPException(500, "Deletion failed")
-    raise HTTPException(404, "Video not found")
+@app.post("/api/cancel/{process_id}")
+async def cancel_processing(process_id: str):
+    if process_id in PROGRESS_STORE:
+        PROGRESS_STORE[process_id]["status"] = "cancelled"
+        return {"status": "cancellation_requested"}
+    raise HTTPException(404, detail="Process not found")
 
-@app.get("/api/progress")
-async def progress_stream():
-    async def event_generator():
-        last_update = None
-        while True:
-            if current_process_id in PROGRESS_STORE:
-                current = PROGRESS_STORE[current_process_id]
-                if current != last_update:
-                    last_update = current
-                    yield f"data: {json.dumps(current)}\n\n"
-            await asyncio.sleep(0.1)
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-@app.post("/api/cancel-analysis")
-async def cancel_analysis():
-    global ANALYSIS_ACTIVE, current_process_id
-    ANALYSIS_ACTIVE = False
-    if current_process_id and current_process_id in PROGRESS_STORE:
-        PROGRESS_STORE[current_process_id] = {
-            "percent": 0,
-            "message": "Analysis cancelled by user",
-            "current_frame": 0,
-            "total_frames": 0
-        }
-        current_process_id = None  # Reset process ID
-    return {"status": "cancelled"}
-
-@app.get("/{full_path:path}")
-async def serve_frontend(full_path: str):
-    # Skip API routes and static files
-    if full_path.startswith(("api/", "static/")):
-        raise HTTPException(status_code=404)
+@app.get("/api/results/{process_id}")
+async def get_results(process_id: str):
+    progress = PROGRESS_STORE.get(process_id)
+    if not progress:
+        raise HTTPException(404, detail="Process not found")
     
-    # Serve index.html for all other routes
-    frontend_path = Path("frontend/index.html")  # Relative to where you run the app
+    if progress.get("status") != "completed":
+        raise HTTPException(425, detail="Analysis not complete")
+    
+    result_path = Path(progress.get("result", ""))
+    if not result_path.exists():
+        raise HTTPException(404, detail="Results not found")
+    
+    return FileResponse(result_path, filename="analysis.csv")
+
+@app.get("/")
+async def serve_frontend():
+    frontend_path = BASE_DIR / "frontend" / "index.html"
     if not frontend_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Frontend not found at {frontend_path.absolute()}"
-        )
+        raise HTTPException(status_code=404, detail="Frontend not found")
     return FileResponse(frontend_path)
+
+app.mount("/static", StaticFiles(directory=BASE_DIR / "frontend" / "static"), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
