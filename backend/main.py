@@ -403,12 +403,12 @@ async def get_results(process_id: str):
 
 @app.get("/")
 async def serve_frontend():
-    frontend_path = BASE_DIR / "frontend" / "index.html"
+    frontend_path =  "frontend" / "index.html"
     if not frontend_path.exists():
         raise HTTPException(status_code=404, detail="Frontend not found")
     return FileResponse(frontend_path)
 
-app.mount("/static", StaticFiles(directory=BASE_DIR / "frontend" / "static"), name="static")
+app.mount("/static", StaticFiles(directory= "frontend" / "static"), name="static")
 
 if __name__ == "__main__":
     import uvicorn
