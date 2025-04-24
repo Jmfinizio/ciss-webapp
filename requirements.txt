@@ -8,3 +8,4 @@ numpy>=1.21.0
 python-multipart>=0.0.5
 aiohttp>=3.7.4
 office365-rest-python-client>=2.3.12
+ffmpeg>=0.2.0
