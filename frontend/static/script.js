@@ -47,6 +47,26 @@ function initEventListeners() {
     document.getElementById('downloadBtn').addEventListener('click', () => {
         // Handled in setupDownload
     });
+    document.getElementById('timestamp1').addEventListener('input', validateTimestamps);
+    document.getElementById('timestamp2').addEventListener('input', validateTimestamps);
+    document.getElementById('timestamp3').addEventListener('input', validateTimestamps);
+}
+
+function validateTimestamps() {
+    const t1 = document.getElementById('timestamp1');
+    const t2 = document.getElementById('timestamp2');
+    const t3 = document.getElementById('timestamp3');
+    const analyzeBtn = document.getElementById('analyzeBtn');
+
+    // Check all fields are valid and filled
+    const isValid = t1.checkValidity() && 
+                    t2.checkValidity() && 
+                    t3.checkValidity() &&
+                    t1.value !== '' &&
+                    t2.value !== '' &&
+                    t3.value !== '';
+
+    analyzeBtn.disabled = !isValid;
 }
 
 function showScreen(screenId) {
@@ -62,8 +82,12 @@ function showScreen(screenId) {
 
 async function handleNewAnalysis() {
     try {
+        // abort any in-flight work and clear the form & progress
         await cancelAnalysis();
         resetApp();
+        // re-enable & relabel the button so it shows "Analyze"
+        resetAnalyzeButton();
+        // go back to the upload/timestamp screen
         showScreen('initialScreen');
     } catch (error) {
         showError(`Failed to start new analysis: ${error.message}`);
@@ -107,6 +131,11 @@ function handleFile(file) {
     preview.src = URL.createObjectURL(file);
     preview.classList.remove('hidden');
     analyzeBtn.disabled = false;
+
+    document.getElementById('timestamp1').value = '';
+    document.getElementById('timestamp2').value = '';
+    document.getElementById('timestamp3').value = '';
+    validateTimestamps();
 }
 
 function showUploadScreen(type) {
@@ -174,6 +203,17 @@ function renderSpFileList(files) {
     `).join('');
 }
 
+// Add validation function
+function validateTimeOrder(t1, t2, t3) {
+    const toSeconds = t => {
+        const [h, m, s] = t.split(':').map(Number);
+        return h * 3600 + m * 60 + s;
+    };
+
+    return toSeconds(t1) < toSeconds(t2) && 
+           toSeconds(t2) < toSeconds(t3);
+}
+
 async function handleSpFile(fileId) {
     const selectBtn = event.target;
     const originalText = selectBtn.innerHTML;
@@ -211,30 +251,35 @@ async function handleSpFile(fileId) {
 }
 
 async function startAnalysis() {
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    analyzeBtn.disabled = true;
+    analyzeBtn.onclick = null;
+    analyzeBtn.innerText = 'Analyzing…';
+
     if (!currentFile) {
         showError('Please select a file first!');
+        resetAnalyzeButton();
         return;
+    }
+
+    const t1 = document.getElementById('timestamp1').value;
+    const t2 = document.getElementById('timestamp2').value;
+    const t3 = document.getElementById('timestamp3').value;
+    if (!validateTimeOrder(t1, t2, t3)) {
+      showError('Timestamps must be in ascending order');
+      resetAnalyzeButton();
+      return;
     }
 
     showScreen('progressScreen');
     analysisAbortController = new AbortController();
 
-    // Setup progress tracking
-    setupProgressTracker();
-
     try {
         const formData = new FormData();
-        
-        if (isSharePointFile) {
-            // Add SharePoint params
-            formData.append('file_id', 'true');
-            formData.append('site_url', spCredentials.siteUrl);
-            formData.append('client_id', spCredentials.clientId);
-            formData.append('client_secret', spCredentials.clientSecret);
-            formData.append('doc_library', spCredentials.docLibrary);
-        } else {
-            formData.append('video', currentFile);
-        }
+        formData.append('video', currentFile);
+        formData.append('timestamp1', t1);
+        formData.append('timestamp2', t2);
+        formData.append('timestamp3', t3);
 
         const response = await fetch(`${API_BASE_URL}/api/process-video`, {
             method: 'POST',
@@ -247,82 +292,77 @@ async function startAnalysis() {
             throw new Error(errorData.detail || response.statusText);
         }
 
-        const blob = await response.blob();
-        setupDownload(blob);
-        showScreen('resultsScreen');
+        const { process_id } = await response.json();
+        setupProgressTracker(process_id);
+
     } catch (error) {
         if (error.name !== 'AbortError') {
             showError(`Analysis failed: ${error.message}`);
             showScreen('initialScreen');
         }
-    } finally {
-        if (progressSource) {
-            progressSource.close();
-            progressSource = null;
-        }
     }
 }
 
-function setupProgressTracker() {
-    const progressContainer = document.querySelector('.progress-container');
-    
-    // Clear existing elements
-    progressContainer.innerHTML = `
-        <div class="progress-bar">
-            <div id="progressBar" class="progress-fill"></div>
-        </div>
-        <div class="progress-info">
-            <span id="progressMessage"></span>
-            <span id="frameCounter" class="time-counter"></span>
-        </div>
-    `;
-    
-    if (!progressContainer) return;
+function setupProgressTracker(processId) {
+    if (progressSource) progressSource.close();
 
-    // Clear any existing frame counter
-    const existingCounter = document.getElementById('frameCounter');
-    if (existingCounter) existingCounter.remove();
-
-    // Create new frame counter
-    const frameCounter = document.createElement('div');
-    frameCounter.id = 'frameCounter';
-    progressContainer.appendChild(frameCounter);
-
-    // Setup SSE connection for progress updates
-    progressSource = new EventSource(`${API_BASE_URL}/api/progress`);
+    progressSource = new EventSource(`${API_BASE_URL}/api/progress/${processId}`);
     
     progressSource.onmessage = (event) => {
         try {
-            const progress = JSON.parse(event.data);
-            updateProgressUI(progress);
+            const data = JSON.parse(event.data);
+            
+            if (data.status === 'completed') {
+                handleAnalysisComplete(processId);
+                progressSource.close();
+            } else if (data.status === 'error') {
+                showError(data.error || 'Analysis failed');
+                progressSource.close();
+                showScreen('initialScreen');
+            } else {
+                updateProgressUI(data);
+            }
         } catch (error) {
-            console.error('Error parsing progress update:', error);
+            console.error('Error parsing progress:', error);
         }
     };
 
     progressSource.onerror = () => {
-        console.error('Progress stream error');
-        if (progressSource) {
-            progressSource.close();
-            progressSource = null;
-        }
+        console.log('SSE error - attempting reconnect');
+        setTimeout(() => setupProgressTracker(processId), 2000);
     };
 }
+
+async function handleAnalysisComplete(processId) {
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/results/${processId}`);
+        const blob = await response.blob();
+        setupDownload(blob);
+        showScreen('resultsScreen');
+    } catch (error) {
+        showError('Failed to retrieve results');
+    }
+}
+
+function resetAnalyzeButton() {
+    const btn = document.getElementById('analyzeBtn');
+    btn.disabled = false;
+    btn.innerText = 'Start Analysis';
+    btn.onclick = startAnalysis;
+  }
+  
 
 function updateProgressUI(progress) {
     const progressBar = document.getElementById('progressBar');
     const progressMessage = document.getElementById('progressMessage');
-    const frameCounter = document.getElementById('frameCounter');
-
-    // Update progress bar
-    const percent = Math.min(100, (progress.current_frame / progress.total_frames) * 100);
-    progressBar.style.width = `${percent}%`;
     
-    // Update frame counter
-    frameCounter.textContent = `Processing frame ${progress.current_frame}/${progress.total_frames}`;
-    
-    // Update status message
+    progressBar.style.width = `${progress.percent}%`;
     progressMessage.textContent = progress.message;
+    
+    if (progress.current && progress.total) {
+        document.getElementById('frameCounter').textContent = 
+            `${progress.current}/${progress.total} seconds processed`;
+    }
 }
 
 function setupDownload(blob) {
@@ -335,7 +375,7 @@ function setupDownload(blob) {
     downloadBtn.onclick = () => {
         const a = document.createElement('a');
         a.href = url;
-        a.download = `child_safety_analysis_${new Date().toISOString().slice(0,10)}.csv`;
+        a.download = `stranger_danger_analysis_${new Date().toISOString().slice(0,10)}.csv`;
         document.body.appendChild(a);
         a.click();
         
@@ -346,6 +386,7 @@ function setupDownload(blob) {
         }, 100);
     };
 }
+
 
 async function cancelAnalysis() {
     try {
@@ -421,6 +462,7 @@ function showError(message) {
         setTimeout(() => errorDiv.remove(), 500);
     }, 5000);
 }
+
 
 // Make functions available globally for HTML onclick attributes
 window.showUploadScreen = showUploadScreen;

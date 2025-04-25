@@ -225,3 +225,27 @@ h1, h2, h3 {
 #newAnalysisBtn {
     margin-top: 1rem;
 }
+
+/* Add to style.css */
+.timestamp-group {
+    display: grid;
+    gap: 1rem;
+    margin: 1.5rem 0;
+}
+
+.timestamp-group .form-group {
+    margin: 0;
+}
+
+input[type="text"] {
+    width: 100%;
+    padding: 0.8rem;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 1rem;
+}
+
+input:invalid {
+    border-color: #ff4444;
+    box-shadow: 0 0 3px #ff4444;
+}
