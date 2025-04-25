@@ -7,6 +7,7 @@ import re
 import subprocess
 import uuid
 import asyncio
+import joblib
 import logging
 import numpy as np
 import pandas as pd
@@ -472,6 +473,11 @@ def process_freeplay(process_id: str, freeplay_video: str) -> float:
             logger.warning(f"Freeplay: no frame at {sec}s")
             continue
 
+        PROGRESS_STORE[process_id].update({
+            "current": sec,
+            "percent": 10 + int((sec + 1) / duration * 30)
+        })
+
         try:
             child_roi = detect_child_and_crop(frame)
             pose_kps = process_pose(child_roi)
@@ -523,7 +529,7 @@ def process_experiment(process_id: str, experiment_video: str, freeplay_movement
 
         PROGRESS_STORE[process_id].update({
             "current": sec,
-            "percent": int((sec + 1) / duration * 100)
+            "percent": 40 + int((sec + 1) / duration * 60)
         })
 
         try:
@@ -538,9 +544,9 @@ def process_experiment(process_id: str, experiment_video: str, freeplay_movement
 
             results.append({
                 "second": sec,
-                "parent_dist": parent_dist,
-                "stranger_dist": stranger_dist,
-                "face_movement": face_score,
+                "distance_adult": parent_dist,
+                "distance_stranger": stranger_dist,
+                "facial_movement": face_score,
                 "body_movement": mov_ratio
             })
 
@@ -552,15 +558,67 @@ def process_experiment(process_id: str, experiment_video: str, freeplay_movement
             # still append a row so CSV timestamps remain aligned
             results.append({
                 "second": sec,
-                "parent_dist": None,
-                "stranger_dist": None,
-                "face_movement": None,
+                "distance_adult": None,
+                "distance_stranger": None,
+                "facial_movement": None,
                 "body_movement": None
             })
 
     cap.release()
     return pd.DataFrame(results)
 
+def apply_classes(df,
+                  distance_model_path='distance_classifier.pkl',
+                  fear_model_path='fear_classifier.pkl',
+                  freeze_model_path='freeze_classifier.pkl'):
+
+    # Load models
+    distance_clf = joblib.load(distance_model_path)
+    fear_clf     = joblib.load(fear_model_path)
+    freeze_clf   = joblib.load(freeze_model_path)
+
+    # 1) Initialize outputs
+    df['proximity to parent']   = None
+    df['proximity to stranger'] = None
+    df['fear']                  = None
+    df['freeze']                = pd.Series([pd.NA] * len(df), dtype="Int64")
+
+    # 2) Distance → proximity classes
+    valid_mask = df[['distance_adult','body_movement','facial_movement']].notnull().all(axis=1)
+    preds_parent = distance_clf.predict(df.loc[valid_mask, ['distance_adult']])
+    df.loc[valid_mask, 'proximity to parent'] = preds_parent
+    df.loc[valid_mask, 'proximity to stranger'] = pd.Series(preds_parent).map({0:2, 1:1, 2:0}).values
+
+    # 3) Fear classifier
+    fear_cols = ['proximity to parent','proximity to stranger','body_movement','facial_movement']
+    fear_mask = df[fear_cols].notnull().all(axis=1)
+    df.loc[fear_mask, 'fear'] = fear_clf.predict(df.loc[fear_mask, fear_cols])
+
+    # 4) Build pairwise DataFrame (includes 'second')
+    df1 = df.iloc[:-1].reset_index(drop=True).add_suffix('_1')
+    df2 = df.iloc[1:].reset_index(drop=True).add_suffix('_2')
+    df_pairs = pd.concat([df1, df2], axis=1)
+
+    # 5) Filter pairs where both fears > 0
+    mask = (df_pairs['fear_1'] > 0) & (df_pairs['fear_2'] > 0)
+    df_filtered = df_pairs[mask].copy()
+    df_filtered['body_movement_avg'] = (df_filtered['body_movement_1'] + df_filtered['body_movement_2']) / 2
+
+    # 6) Predict freeze and backfill to both seconds
+    if not df_filtered.empty:
+        df_filtered['freeze'] = freeze_clf.predict(df_filtered[['body_movement_avg']])
+        for _, row in df_filtered.iterrows():
+            for sec_col in ('second_1', 'second_2'):
+                sec = int(row[sec_col])
+                # find the index of that row
+                idx = df.index[df['second'] == sec][0]
+                current = df.at[idx, 'freeze']
+
+                if not (pd.notna(current) and current == 1):
+                    df.at[idx, 'freeze'] = row['freeze']
+                    
+    # 7) Return only the final columns
+    return df[['second','proximity to parent','proximity to stranger','fear','freeze']]
 
 async def process_video_async(process_id: str, video_path: Path, session_dir: Path,
                               timestamp1: str, timestamp2: str, timestamp3: str, temp_dir: Path):
@@ -609,20 +667,28 @@ async def process_video_async(process_id: str, video_path: Path, session_dir: Pa
             "message": "Analyzing freeplay movement",
             "percent": 10
         })
-        
-        freeplay_movement = process_freeplay(process_id, freeplay_video)
+        freeplay_movement = await asyncio.to_thread(
+            process_freeplay,
+            process_id,
+            freeplay_video
+        )
 
-
-        # Process experiment segment
+        # Process experiment segment in a thread
         PROGRESS_STORE[process_id].update({
             "message": "Analyzing experiment",
-            "percent": 30
+            "percent": 40
         })
+        result_df = await asyncio.to_thread(
+            process_experiment,
+            process_id,
+            experiment_video,
+            freeplay_movement
+        )
 
-        result_df = process_experiment(process_id, experiment_video, freeplay_movement)
+        final_df = apply_classes(result_df)
         
         result_path = session_dir / "analysis.csv"
-        result_df.to_csv(result_path, index=False)
+        final_df.to_csv(result_path, index=False)
         os.sync()
 
         PROGRESS_STORE[process_id].update({
@@ -690,22 +756,24 @@ async def start_processing(
 @app.get("/api/progress/{process_id}")
 async def progress_stream(process_id: str):
     async def event_generator():
-        last = None
+        last = {}
         while True:
             if process_id in PROGRESS_STORE:
                 current = PROGRESS_STORE[process_id]
                 if current != last:
-                    last = current
+                    last = current.copy()    # snapshot instead of alias
                     yield f"data: {json.dumps(current)}\n\n"
                 if current["status"] in ["completed", "error", "cancelled"]:
                     break
             await asyncio.sleep(0.5)
-        yield "data: [DONE]\n\n"
     
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache"}
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection":    "keep-alive"   # ensure the stream stays open
+        }
     )
 
 @app.get("/api/results/{process_id}")

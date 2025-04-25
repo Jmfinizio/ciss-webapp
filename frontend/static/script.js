@@ -82,8 +82,12 @@ function showScreen(screenId) {
 
 async function handleNewAnalysis() {
     try {
+        // abort any in-flight work and clear the form & progress
         await cancelAnalysis();
         resetApp();
+        // re-enable & relabel the button so it shows "Analyze"
+        resetAnalyzeButton();
+        // go back to the upload/timestamp screen
         showScreen('initialScreen');
     } catch (error) {
         showError(`Failed to start new analysis: ${error.message}`);
@@ -343,7 +347,7 @@ async function handleAnalysisComplete(processId) {
 function resetAnalyzeButton() {
     const btn = document.getElementById('analyzeBtn');
     btn.disabled = false;
-    btn.innerText = 'Analyze';
+    btn.innerText = 'Start Analysis';
     btn.onclick = startAnalysis;
   }
   

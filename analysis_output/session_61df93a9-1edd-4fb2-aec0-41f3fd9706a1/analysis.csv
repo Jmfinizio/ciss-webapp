@@ -1,0 +1,5 @@
+second,proximity to parent,proximity to stranger,fear,freeze
+0,1,1,0,False
+1,1,1,2,False
+2,1,1,0,False
+3,1,1,2,False
