@@ -5,6 +5,7 @@ import json
 import time
 import re
 import subprocess
+import uuid
 import asyncio
 import logging
 import numpy as np
@@ -64,7 +65,7 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # Configuration
 MODEL_PATH = "parents_child_stranger.pt"
 MAX_VIDEO_SIZE = 500 * 1024 * 1024
-OUTPUT_DIR = "analysis_output"
+OUTPUT_DIR = Path("analysis_output")
 UPLOADED_VIDEOS = {}  # Track uploaded video session
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -240,8 +241,8 @@ def calculate_distance_between_objects(frame, obj1_label, obj2_label):
     try:
         # Estimate depth
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(img_rgb)
-        input_tensor = transform_pipeline(img_pil)
+        img_pil = Image.fromarray(img_rgb)  # Convert to PIL Image first
+        input_tensor = transform_pipeline(img_pil).to(device)
 
         if input_tensor.dim() == 3:
             input_tensor = input_tensor.unsqueeze(0)
@@ -280,7 +281,7 @@ def calculate_distance_between_objects(frame, obj1_label, obj2_label):
             return None
 
         # 3D coordinate conversion
-        fx = fy = 500  # Focal length assumption
+        fx = fy = 1109  # Focal length assumption
         cx, cy = depth_w // 2, depth_h // 2
 
         point1 = (
@@ -402,7 +403,6 @@ def crop_video(video_path: str, timestamp1: str, timestamp2: str, timestamp3: st
     - First clip: timestamp1 to timestamp2
     - Second clip: timestamp2 to timestamp3
     """
-    import os, uuid, subprocess
     ts1 = time_to_seconds(timestamp1)
     ts2 = time_to_seconds(timestamp2)
     ts3 = time_to_seconds(timestamp3)
@@ -442,124 +442,97 @@ def crop_video(video_path: str, timestamp1: str, timestamp2: str, timestamp3: st
 # Video Processing Loop
 #################################################
 
-async def process_video_async(process_id: str, video_path: Path, session_dir: Path,
-                              timestamp1: str, timestamp2: str, timestamp3: str, temp_dir: Path,
-                              ffmpeg_path: str = "ffmpeg"):
-    try:
-        # Initialize progress tracking
-        PROGRESS_STORE[process_id] = {
-            "status": "processing",
-            "percent": 0,
-            "message": "Initializing",
-            "result": None,
-            "error": None
-        }
+def process_freeplay(process_id: str, freeplay_video: str) -> float:
+    """
+    Sample one frame per second from the freeplay clip,
+    compute body‐movement metrics and return the average.
+    """
+    PROGRESS_STORE[process_id].update({"message": "Processing freeplay"})
+    cap = cv2.VideoCapture(freeplay_video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open freeplay video at {freeplay_video}")
 
-        # Validate timestamps
-        def validate_timestamp(t):
-            parts = t.split(':')
-            return (len(parts) == 3 and all(p.isdigit() for p in parts))
-        
-        if not all(validate_timestamp(ts) for ts in [timestamp1, timestamp2, timestamp3]):
-            raise ValueError("Invalid timestamp format")
+    # Determine clip duration in seconds
+    fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    duration = total_frames / fps
 
-        # Crop video
-        PROGRESS_STORE[process_id].update({
-            "message": "Cropping video segments",
-            "percent": 5
-        })
-        
-        freeplay_video, experiment_video = await asyncio.to_thread(
-            crop_video,
-            str(video_path),
-            timestamp1,
-            timestamp2,
-            timestamp3,
-            str(temp_dir)
-        )
+    movements = []
+    prev_pose = None
 
-        # Process freeplay segment
-        PROGRESS_STORE[process_id].update({
-            "message": "Analyzing freeplay movement",
-            "percent": 10
-        })
-        
-        cap_fp = cv2.VideoCapture(str(freeplay_video))
-        fps_fp = cap_fp.get(cv2.CAP_PROP_FPS)
-        freeplay_movements = []
-        prev_pose = None
+    for sec in range(int(duration)):
+        print(f"Processing freeplay frame {sec}")
+        if PROGRESS_STORE[process_id]["status"] == "cancelled":
+            break
 
-        for sec in range(int(cap_fp.get(cv2.CAP_PROP_FRAME_COUNT) / fps_fp)):
-            await asyncio.sleep(0)
-            print(f"Processing freeplay frame {sec}")
-            if PROGRESS_STORE[process_id]["status"] == "cancelled":
-                break
-                
-            cap_fp.set(cv2.CAP_PROP_POS_FRAMES, int(sec * fps_fp))
-            ret, frame = cap_fp.read()
-    
-            if not ret or frame is None or frame.size == 0:
-                logger.warning("Skipping invalid frame")
-                continue
+        # Seek by time (ms)
+        cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
+        ret, frame = cap.read()
+        if not ret or frame is None or frame.size == 0:
+            logger.warning(f"Freeplay: no frame at {sec}s")
+            continue
 
+        try:
             child_roi = detect_child_and_crop(frame)
             pose_kps = process_pose(child_roi)
-            if pose_kps is not None:
-                mv = calculate_body_movement(pose_kps, prev_pose)
-                freeplay_movements.append(mv)
-                prev_pose = pose_kps
+            mv = calculate_body_movement(pose_kps, prev_pose)
+            movements.append(mv)
+            prev_pose = pose_kps
+        except Exception as e:
+            logger.error(f"Freeplay error at {sec}s: {e}", exc_info=True)
 
-        cap_fp.release()
-        freeplay_movement = np.mean(freeplay_movements) if freeplay_movements else 0.0
+    cap.release()
+    return float(np.mean(movements)) if movements else 0.0
 
-        # Process experiment segment
+def process_experiment(process_id: str, experiment_video: str, freeplay_movement: float) -> pd.DataFrame:
+    """
+    Sample one frame per second from the experiment clip,
+    compute all metrics, and return a DataFrame.
+    """
+    PROGRESS_STORE[process_id].update({"message": "Analyzing experiment"})
+    cap = cv2.VideoCapture(experiment_video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open experiment video at {experiment_video}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    duration = total_frames / fps
+    PROGRESS_STORE[process_id].update({"total": int(duration)})
+
+    results = []
+    prev_landmarks = None
+    prev_pose = None
+
+    for sec in range(int(duration)):
+        print(f"Processing experiment frame {sec}")
+        if PROGRESS_STORE[process_id]["status"] == "cancelled":
+            break
+
+        cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
+        ret, frame = cap.read()
+        if not ret or frame is None or frame.size == 0:
+            logger.warning(f"Experiment: no frame at {sec}s")
+            results.append({
+                "second": sec,
+                "parent_dist": None,
+                "stranger_dist": None,
+                "face_movement": None,
+                "body_movement": None
+            })
+            continue
+
         PROGRESS_STORE[process_id].update({
-            "message": "Analyzing experiment",
-            "percent": 30
+            "current": sec,
+            "percent": int((sec + 1) / duration * 100)
         })
-        
-        cap_exp = cv2.VideoCapture(str(experiment_video))
-        fps_exp = cap_exp.get(cv2.CAP_PROP_FPS)
-        results = []
-        prev_landmarks = None
-        prev_pose = None
-        total_seconds = int(cap_exp.get(cv2.CAP_PROP_FRAME_COUNT) / fps_exp)
-        for sec in range(total_seconds):
-            progress_percent = int((sec / total_seconds) * 65) + 30  # 30-95% range
-            PROGRESS_STORE[process_id].update({
-                "percent": progress_percent,
-                "current": sec,
-                "total": total_seconds
-            })
-            
-            print(f"Processing experiment frame {sec}")
-            if PROGRESS_STORE[process_id]["status"] == "cancelled":
-                break
 
-            ret, frame = cap_exp.read()
-            
-            if not ret or frame is None or frame.size == 0:
-                logger.warning("Skipping invalid frame")
-                continue
-
-            # Update progress
-            progress = int(sec/int(cap_exp.get(cv2.CAP_PROP_FRAME_COUNT) / fps_exp))
-            PROGRESS_STORE[process_id].update({
-                "percent": progress,
-                "current": sec,
-                "total": total_frames
-            })
-
-            # Analysis logic
+        try:
             child_roi = detect_child_and_crop(frame)
-            if child_roi is None:
-                continue
-
             face_score, curr_landmarks = facial_keypoints(child_roi, prev_landmarks)
             pose_kps = process_pose(child_roi)
             body_mv = calculate_body_movement(pose_kps, prev_pose)
             mov_ratio = body_mv / freeplay_movement if freeplay_movement else 0.0
-            
+
             parent_dist = calculate_distance_between_objects(frame, "Child", "Adult")
             stranger_dist = calculate_distance_between_objects(frame, "Child", "Stranger")
 
@@ -574,144 +547,146 @@ async def process_video_async(process_id: str, video_path: Path, session_dir: Pa
             prev_landmarks = curr_landmarks
             prev_pose = pose_kps
 
-        # Save final results
-        csv_path = session_dir / "analysis.csv"
-        pd.DataFrame(results).to_csv(csv_path, index=False)
+        except Exception as e:
+            logger.error(f"Experiment error at {sec}s: {e}", exc_info=True)
+            # still append a row so CSV timestamps remain aligned
+            results.append({
+                "second": sec,
+                "parent_dist": None,
+                "stranger_dist": None,
+                "face_movement": None,
+                "body_movement": None
+            })
 
-        # Add validation
-        if not csv_path.exists():
-            raise FileNotFoundError(f"Analysis results not created at {csv_path}")
-        if csv_path.stat().st_size == 0:
-            csv_path.unlink()
-            raise RuntimeError("Empty analysis results file created")
+    cap.release()
+    return pd.DataFrame(results)
 
-        # Update progress after successful CSV creation
+
+async def process_video_async(process_id: str, video_path: Path, session_dir: Path,
+                              timestamp1: str, timestamp2: str, timestamp3: str, temp_dir: Path):
+
+    if PROGRESS_STORE.get(process_id, {}).get("started"):
+        return
+    
+    # Initialize progress tracking
+    PROGRESS_STORE[process_id] = {
+        "started": True,
+        "status":  "processing",
+        "percent": 0,
+        "message": "Initializing",
+        "result":  None,
+        "error":   None
+    }
+
+    # Validate timestamps
+    def validate_timestamp(t):
+        parts = t.split(':')
+        return (len(parts) == 3 and all(p.isdigit() for p in parts))
+    
+    if not all(validate_timestamp(ts) for ts in [timestamp1, timestamp2, timestamp3]):
+        raise ValueError("Invalid timestamp format")
+
+    # Crop video
+    PROGRESS_STORE[process_id].update({
+        "message": "Cropping video segments",
+        "percent": 5
+    })
+    
+    
+    try:
+        freeplay_video, experiment_video = await asyncio.to_thread(
+            crop_video,
+            str(video_path),
+            timestamp1,
+            timestamp2,
+            timestamp3,
+            str(temp_dir)
+        )
+
+
+        # Process freeplay segment
         PROGRESS_STORE[process_id].update({
-            "status": "completed",
-            "percent": 100,
-            "message": "Analysis complete",
-            "result": str(csv_path)
+            "message": "Analyzing freeplay movement",
+            "percent": 10
+        })
+        
+        freeplay_movement = process_freeplay(process_id, freeplay_video)
+
+
+        # Process experiment segment
+        PROGRESS_STORE[process_id].update({
+            "message": "Analyzing experiment",
+            "percent": 30
         })
 
+        result_df = process_experiment(process_id, experiment_video, freeplay_movement)
+        
+        result_path = session_dir / "analysis.csv"
+        result_df.to_csv(result_path, index=False)
+        os.sync()
+
+        PROGRESS_STORE[process_id].update({
+            "status": "completed",
+            "result": str(result_path),
+            "percent": 100,
+            "message": "Analysis complete"
+        })
+        
     except Exception as e:
-        logger.error(f"Processing failed: {str(e)}")
+        logger.error(f"Processing error: {str(e)}", exc_info=True)
         PROGRESS_STORE[process_id].update({
             "status": "error",
             "error": str(e),
             "percent": 100
         })
-        
+    
     finally:
-        cleanup_done = False
-        resources_to_clean = []
-        
-        try:
-            # Track cleanup resources
-            resources_to_clean = []
+        if video_path.exists():
+            video_path.unlink()
             
-            # Release video captures
-            if 'cap_fp' in locals():
-                resources_to_clean.append(("Freeplay video capture", cap_fp))
-            if 'cap_exp' in locals():
-                resources_to_clean.append(("Experiment video capture", cap_exp))
-            
-            # Clean up video captures
-            for name, cap in resources_to_clean:
-                try:
-                    if cap.isOpened():
-                        cap.release()
-                        logger.info(f"Released {name}")
-                except Exception as e:
-                    logger.error(f"Failed to release {name}: {str(e)}")
-            
-            # Clean temp directory
-            if temp_dir.exists():
-                try:
-                    shutil.rmtree(temp_dir)
-                    logger.info(f"Cleaned temp directory: {temp_dir}")
-                except Exception as e:
-                    logger.error(f"Failed to clean temp directory: {str(e)}")
-                    # Try alternative cleanup
-                    try:
-                        subprocess.run(['rm', '-rf', str(temp_dir)], check=True)
-                    except:
-                        logger.critical("Complete directory cleanup failure!")
-
-            cleanup_done = True
-            
-        except Exception as cleanup_err:
-            logger.error(f"Cleanup error: {cleanup_err}")
-            cleanup_done = False
-            
-        finally:
-            if not cleanup_done:
-                logger.critical("""
-                    CRITICAL CLEANUP FAILURE!
-                    Potential resource leaks detected:
-                    Unreleased resources: %s
-                    Temp directory exists: %s (%s)
-                    """, 
-                    [name for name, _ in resources_to_clean],
-                    temp_dir.exists(),
-                    temp_dir if temp_dir.exists() else ""
-                )
-                
-            # Final verification
-            remaining = [
-                (name, cap) for name, cap in resources_to_clean 
-                if cap.isOpened()
-            ]
-            if remaining:
-                logger.critical(
-                    "Unreleased resources remaining: %s", 
-                    [name for name, _ in remaining]
-                )
-            
-
-
 #################################################
 # API Endpoints
 #################################################
 
 @app.post("/api/process-video")
 async def start_processing(
-    background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     timestamp1: str = Form(...),
     timestamp2: str = Form(...),
     timestamp3: str = Form(...)
 ):
-    # Validate timestamps
-    for ts in (timestamp1, timestamp2, timestamp3):
-        if not re.match(r"^\d{2}:\d{2}:\d{2}$", ts):
-            raise HTTPException(400, "Invalid timestamp format (HH:MM:SS)")
-
+    # 1) Generate IDs & dirs
     process_id = str(uuid.uuid4())
-    session_dir = Path(OUTPUT_DIR).absolute() / f"session_{process_id}"
-    session_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create temporary directory for processing
     temp_dir = Path(tempfile.mkdtemp())
+    session_dir = OUTPUT_DIR / f"session_{process_id}"
+    session_dir.mkdir(exist_ok=True)
 
-    # Save video to session directory
-    video_path = session_dir / video.filename
-    with video_path.open("wb") as buffer:
-        shutil.copyfileobj(video.file, buffer)
+    # 2) Seed progress (so /api/progress can pick it up immediately)
+    PROGRESS_STORE[process_id] = {
+        "started": False,
+        "status":  "queued",
+        "percent": 0,
+        "message": "Queued for processing",
+        "result":  None,
+        "error":   None
+    }
 
-    # Update background task to include temp_dir
-    background_tasks.add_task(
-        process_video_async,
-        process_id,
-        video_path,
-        session_dir,
-        timestamp1,
-        timestamp2,
-        timestamp3,
-        temp_dir,  # Pass the temp_dir here
+    # 3) Save the upload
+    video_path = temp_dir / video.filename
+    with open(video_path, "wb") as f:
+        f.write(await video.read())
+
+    # 4) Kick off the async worker on the loop directly
+    asyncio.create_task(
+        process_video_async(
+            process_id, video_path, session_dir,
+            timestamp1, timestamp2, timestamp3, temp_dir
+        )
     )
 
+    # 5) Return the process_id immediately
     return {"process_id": process_id}
-
+    
 @app.get("/api/progress/{process_id}")
 async def progress_stream(process_id: str):
     async def event_generator():
@@ -725,6 +700,7 @@ async def progress_stream(process_id: str):
                 if current["status"] in ["completed", "error", "cancelled"]:
                     break
             await asyncio.sleep(0.5)
+        yield "data: [DONE]\n\n"
     
     return StreamingResponse(
         event_generator(),
@@ -742,19 +718,19 @@ async def results(process_id: str):
     if status["status"] == "completed":
         csv_path = Path(status["result"])
         try:
+            # Validate file exists and is readable
+            if not csv_path.exists() or csv_path.stat().st_size == 0:
+                raise FileNotFoundError("Result file missing or empty")
+                
             return FileResponse(
                 csv_path,
                 media_type="text/csv",
-                filename="analysis_results.csv",
+                filename="child_safety_analysis.csv",
                 headers={"X-Analysis-Complete": "true"}
             )
-        except FileNotFoundError:
-            logger.error(f"Missing results file: {csv_path}")
-            PROGRESS_STORE[process_id].update({
-                "status": "error",
-                "error": "Results file missing"
-            })
-            raise HTTPException(500, "Results file missing")
+        except Exception as e:
+            logger.error(f"Results delivery failed: {str(e)}")
+            raise HTTPException(500, detail="Results generation failed")
     
     raise HTTPException(425, detail="Analysis not complete yet")
 
