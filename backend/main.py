@@ -1,3 +1,4 @@
+import datetime
 import os
 import cv2
 import uuid
@@ -64,7 +65,7 @@ static_dir = Path(__file__).parent.parent / "frontend" / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 # Configuration
-MODEL_PATH = "parents_child_stranger.pt"
+MODEL_PATH = "yolo_retrained_model.pt"
 MAX_VIDEO_SIZE = 500 * 1024 * 1024
 OUTPUT_DIR = Path("analysis_output")
 UPLOADED_VIDEOS = {}  # Track uploaded video session
@@ -567,7 +568,7 @@ def process_experiment(process_id: str, experiment_video: str, freeplay_movement
     cap.release()
     return pd.DataFrame(results)
 
-def apply_classes(df,
+def apply_classes(df, timestamp_start, timestamp_end,
                   distance_model_path='distance_classifier.pkl',
                   fear_model_path='fear_classifier.pkl',
                   freeze_model_path='freeze_classifier.pkl'):
@@ -610,15 +611,20 @@ def apply_classes(df,
         for _, row in df_filtered.iterrows():
             for sec_col in ('second_1', 'second_2'):
                 sec = int(row[sec_col])
-                # find the index of that row
                 idx = df.index[df['second'] == sec][0]
                 current = df.at[idx, 'freeze']
-
                 if not (pd.notna(current) and current == 1):
                     df.at[idx, 'freeze'] = row['freeze']
-                    
-    # 7) Return only the final columns
-    return df[['second','proximity to parent','proximity to stranger','fear','freeze']]
+
+    # 7) Add timestamps column based on timestamp_start and 'second'
+    time_format = '%H:%M:%S'
+    ts_start = datetime.datetime.strptime(timestamp_start, time_format)
+    df['timestamp'] = df['second'].apply(
+        lambda x: (ts_start + datetime.timedelta(seconds=int(x))).time().strftime(time_format)
+    )
+
+    # 8) Return only the final columns
+    return df[['timestamp', 'second', 'proximity to parent', 'proximity to stranger', 'fear', 'freeze']]
 
 async def process_video_async(process_id: str, video_path: Path, session_dir: Path,
                               timestamp1: str, timestamp2: str, timestamp3: str, temp_dir: Path):
@@ -685,7 +691,7 @@ async def process_video_async(process_id: str, video_path: Path, session_dir: Pa
             freeplay_movement
         )
 
-        final_df = apply_classes(result_df)
+        final_df = apply_classes(result_df, timestamp2, timestamp3)
         
         result_path = session_dir / "analysis.csv"
         final_df.to_csv(result_path, index=False)
@@ -793,7 +799,7 @@ async def results(process_id: str):
             return FileResponse(
                 csv_path,
                 media_type="text/csv",
-                filename="child_safety_analysis.csv",
+                filename="stranger_danger_analysis.csv",
                 headers={"X-Analysis-Complete": "true"}
             )
         except Exception as e:
