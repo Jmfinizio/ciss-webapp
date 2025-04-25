@@ -375,7 +375,7 @@ function setupDownload(blob) {
     downloadBtn.onclick = () => {
         const a = document.createElement('a');
         a.href = url;
-        a.download = `child_safety_analysis_${new Date().toISOString().slice(0,10)}.csv`;
+        a.download = `stranger_danger_analysis_${new Date().toISOString().slice(0,10)}.csv`;
         document.body.appendChild(a);
         a.click();
         
